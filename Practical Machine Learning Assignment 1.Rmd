@@ -1,0 +1,324 @@
+---
+title: "Practical Machine Learning Assignment"
+author: "Long Huynh"
+date: "27 March 2016"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include = FALSE}
+
+# Load relevant libraries
+
+library(dplyr); library(magrittr); library(readr); library(lubridate); library(tibble);library(stringr); library(purrr); library(tidyr); library(knitr); library(randomForest); library(e1071); library(gbm)
+
+```
+
+
+```{r Import, cache=TRUE}
+
+
+pml_train <- suppressWarnings(read_csv('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv'))
+pml_test <- suppressWarnings(read_csv('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'))
+
+vStartDt <-  pml_train$cvtd_timestamp %>% ymd_hms() %>% min()
+vEndDt <- pml_train$cvtd_timestamp %>% ymd_hms() %>% max()
+vTrainRows <- pml_train$user_name %>% unique %>% length()
+vTestRows <- pml_train$classe %>% unique %>% length()
+
+```
+
+## Introduction
+
+In this assignment I will be using a series of machine learning techniques to predict the correct execution of weight lifting techniques. The data is based off a project undertaken in 2011 between November to December with the source found in the following link <http://groupware.les.inf.puc-rio.br/har>. In the project there were `r vTrainRows` subjects that were asked to perform barbell lifts in 5 different ways (each lift being categorized and ranked between A to E). This data was captured from a accelerometer on the belt, forearm, arm and dumbbell and each lift was assigned to `r vTestRows`different classes. For this assignment I will using the data taken from the accelerometers in 2011 to predict the classes of the 5 different barbell lifts.
+
+## Reviewing the structure of the data
+
+Before beginning to choose my machine learning strategy I needed to explore the data, ensuring the data is suitable to undertake analysis. The dataset from the study is split into 2 parts a test and training dataset. I will be building my machine learning models on the training dataset. In total there are `r ncol(pml_train)` variables with train dataset containing `r nrow(pml_train)` observations and the test set containing `r nrow(pml_test)`. 
+
+
+```{r size = 10}
+
+str(pml_train) #Review of the structure of the dataset.
+
+```
+
+## Removing variable unsuitable for models
+
+When reviewing the structure of the train dataset I noticed a couple of issues that needed to resolved before I could begin my machine learning models:
+
+* Some variables were incorrectly classed e.g. numeric variables allocated to character variables.
+* Some variables contained NA values.
+
+I also wanted to identify if there were any columns that were unsuitable for machine learning techniques.
+
+* Do any columns show significant variability?
+* Are there any columns that are too closely correlated?
+
+## Identifying incorrectly classed variables
+
+```{r Incorrectly classed, cache=TRUE}
+
+pml_train %<>% #Tidy Training data - Column classes
+    mutate(user_name = factor(user_name), #few uses and there factor
+           cvtd_timestamp = dmy_hm(cvtd_timestamp), #Turn into a date format
+           new_window = factor(new_window), #New_window is factor variable
+           classe = factor(classe)) %>% #Classe is factor variable
+    mutate_each_(funs(suppressWarnings(as.numeric(.))), #Turn columns into numeric values
+                 names(pml_train) %>% grep('belt|arm|dumbbell|forearm', x =.) %>% names(pml_train)[.])
+
+vClasse <- pml_train$classe %>% unique #classes
+
+pml_test %<>% #Tidy Training data - Column classes
+    mutate(user_name = factor(user_name), #few uses and there factor
+           cvtd_timestamp = dmy_hm(cvtd_timestamp), #Turn into a date format
+           new_window = factor(new_window)) %>% #Classe is factor variable
+    mutate_each_(funs(suppressWarnings(as.numeric(.))), #Turn columns into numeric values
+                 names(pml_test) %>% grep('belt|arm|dumbbell|forearm', x =.) %>% names(pml_test)[.])
+
+```
+
+I realigned each column to its correct class based on my observations. E.g there were numeric variables catergorised as character variables.
+
+## Identifying Variables containing NA values
+
+```{r NA values, cache=TRUE}
+
+keepNms <- #Name vector identifying columns with greater than 97% of values not NA
+    pml_train %>% 
+    sapply(function(x){is.na(x) %>% sum}) %>% #Find the number of NA values across columns
+    {(.)/dim(pml_train)[1]} %>% #Propotion NA values
+    {(.) < 0.97} %>% # Find columns that have less that 97% NA values
+    grep(T, x = .) %>% # Get names
+    names(pml_train)[.] %>%  # Remove ID variable
+    .[2:length(.)]
+
+
+NaNms <- # Imputing missing data - magnet_dumbbell
+    pml_train[, keepNms] %>%
+    sapply(function(x){suppressWarnings(is.na(x)) %>% sum}) %>% 
+    {(.) > 0} %>% 
+    grep(T, x = .) %>% 
+    names(pml_train[, keepNms])[.]
+
+```
+
+We know that majority of machine learning techniques do not work well with NA values. Therefore I identified all columns that have less than 97% NA values. Of these column I then identified the remaining columns with 3% or below NA values. I will use k nearest neighbor to place an average value ensuring we do not lose remaining data.
+
+## Identify variables that lack of variability
+
+```{r Variability, cache=TRUE}
+
+NmsLackVariablity <- # Identify columns with lack of variability
+    pml_train[, keepNms] %>% 
+    caret::nearZeroVar() %>%  
+    names(pml_train[, keepNms])[.]
+
+```
+
+Columns that lack variability will not help the machine learning models, therefore I reviewed each columns using the nearZeroVar from the caret package. I found new_window lacked variability and I therefore removed this column.
+
+## Identify any columns that are highly correlated
+```{r Corrleated, cache=TRUE}
+
+tempTrain <- #Temporary table to review highly correlated colums
+    pml_train[, keepNms] %>%
+    select(num_window:classe) %>%
+    filter(!is.na(magnet_dumbbell_z)) 
+
+NmsCorrelated <- # Identify columns that were highly corrleated
+    tempTrain %>% 
+    select(-classe) %>% 
+    mutate_each(funs(as.numeric)) %>% 
+    cor() %>%
+    {which(.>0.9, arr.ind = T)} %>% # Variables with 90% or greater correlation
+    as_data_frame() %>% 
+    mutate(low = ifelse(row < col , row, col),
+           high = ifelse(row > col , row, col)) %>% 
+    select(low:high) %>% 
+    filter(low != high) %>% 
+    unique
+
+par(mfrow = c(1, 3))
+for(i in 1:dim(NmsCorrelated)[1]){
+    tempTrain[, c(NmsCorrelated[[i, 1]], NmsCorrelated [[i, 2]])] %>% 
+    plot(main = paste(names(.[, 1]),'vs',names(.[, 2])) %>% str_replace_all('_',' '))
+}
+
+
+```
+
+I then wanted to review if there was any columns that were highly correlated and would transform/removed such columns. From reviewing the highly correlated columns (where the correlation exceeded 90%) I did not feel there was any columns I should transform/removed based on the plot patterns.
+
+#### Clean and shuffle the training dataset based on findings.
+
+```{r Clearn data, cache=TRUE}
+
+set.seed(34135) # Set random seed
+trainClean <- # Clean data that can be split into
+    pml_train[, keepNms] %>% 
+    dplyr::select(-one_of(NmsLackVariablity), -user_name:-cvtd_timestamp) %>% 
+    as.data.frame() %>% #kNN only works when convered into base data frame
+    VIM::kNN() %>% #Use k nearest neighbour to impute NA values
+    as_data_frame() %>% #Convert back to tibble
+    select(-ends_with('_imp')) %>% 
+    .[sample(nrow(.)),] #Shuffle the dataset
+
+
+testClean <- 
+    pml_test[, keepNms[1:length(keepNms)-1]] %>% 
+    dplyr::select(-one_of(NmsLackVariablity), -user_name:-cvtd_timestamp)
+    
+```
+
+On both my train and test sets I removed columns with a high NA value and columns not needed for testing. Additionally I imputed any remaining NA values using k nearest neighbor. I opted not to transform the highly correlated columns (90% or greater) as there seems to be an interesting pattern based on the plots that were drawn
+
+## K Fold Cross validation
+
+```{r}
+
+trainProp <- 0.7; testProp <- 1 - trainProp; n <- nrow(trainClean)
+train <- trainClean[1:round(trainProp * n),]
+test <- trainClean[(round(trainProp * n) + 1):n,]
+
+```
+
+I split the data set into a test (`r paste(testProp * 100,'%', sep = '')`) and training set (`r paste(trainProp * 100,'%', sep = '')`). 
+
+```{r cache = TRUE}
+
+nFolds <- 3
+perf <- function(x, y) {sum(x == y)/length(x)}
+# Set random seed. Don't remove this line.
+set.seed(35343)
+KFolds <- rep(0, nFolds) %>% as.list()
+
+for(i in 1:nFolds){
+    KFolds[[i]] <- 
+        train %>% 
+        mutate(TestID = 1, TestID = cumsum(TestID) %>% cut(nFolds, labels(1:nFolds)),
+               set = ifelse(TestID == i, 'Test', 'Train')) %>% 
+        select(-TestID, -num_window) %>% 
+        group_by(set) %>% 
+        nest() %>% 
+        spread(set, data)
+}
+KFolds %<>% do.call('rbind', .); KFolds
+
+```
+
+To decide on the best machine learning model I will cross validate my training data set into 3 k folds. This will ensure that we provide a fair estimate of each models accuracy. Due to the size of the dataset and complexity of the different models I decided on only 3 partitions.
+
+
+```{r cache = TRUE}
+accsRF <- rep(0, nFolds)
+accsGBM <- rep(0, nFolds)
+accsSVM <- rep(0, nFolds)
+set.seed(34137)
+for (i in 1:nFolds) {
+
+  accsRF[i] <- # Random Forrest
+      KFolds[i, 2] %>%
+      unnest() %>%
+      randomForest(classe ~ ., data = ., distribution = 'multinomial') %>%
+      predict(KFolds[i, 1] %>% unnest, type = 'class') %>%
+      perf(KFolds[i, 1] %>% unnest %>% .$classe)
+
+  accsGBM[i] <- # Generalised Boosting
+      KFolds[i, 2] %>%
+      unnest() %>%
+      gbm(classe ~ ., data = ., distribution = 'multinomial',
+          n.trees = 200, interaction.depth = 5, shrinkage = 0.005) %>%
+      predict(KFolds[i, 1] %>% unnest, n.trees = 200, type = 'response') %>%
+      apply(1, which.max) %>%
+      unique(vClasse)[.] %>%
+      perf(KFolds[i, 1] %>% unnest %>% .$classe)
+
+  accsSVM[i] <- # SVM
+      KFolds[i, 2] %>%
+      unnest() %>%
+      svm(classe ~ ., data = .) %>%
+      predict(KFolds[i, 1] %>% unnest, type = 'class') %>%
+      perf(KFolds[i, 1] %>% unnest %>% .$classe)
+
+}
+
+# Print out the mean of accuracy rates
+accsRF %>% print() #Random Forest
+summary(accsRF)
+
+accsGBM %>% print() #Generalised Boosting
+summary(accsGBM)
+
+accsSVM %>% print() #Support Vector Machine
+summary(accsSVM)
+
+
+```
+
+I undertook 3 powerful machine learning techniques Random Forrest, Generalised Boosting and Support Vector Machines, which have historically performed well in Kaggle competitions. The data highlights that the Random Forest performed the best out of the 3 models. Its mean was `r round(mean(accsRF),2)` which performed significantly better than the 2 other models. Random Forest tends to perform better with a larger number of variables and are not significantly affect by outliers (unlike SVM). Due to the excellent performance of Random Forest I did not feel I needed to ensemble the models. Additionally I did not want to add complexity to the model.
+
+## Out of Sample Error rate
+
+```{r cache = TRUE}
+set.seed(34138)
+fitModelRF <- randomForest(classe ~ ., data = train, distribution = 'multinomial')
+#fitModelRF <- readRDS('./fitModelRF.Rds')
+#saveRDS(fitModelRF, 'fitModelRF.Rds')
+
+predictRF <- predict(fitModelRF, test, type = 'class')
+perf(predictRF, test$classe)
+fitModelRF
+fitModelRF %>% summary
+
+```
+
+The results from my model against my test set was `r perf(predictRF, test$classe)*100`% which is extremely high. I think the model maybe over fitting and I can actually reduce the number of variables.
+
+```{r}
+varImpPlot(fitModelRF)
+```
+
+The plot above indicates that there are some variables that contributed to the model significantly more then others. I could therefore reduce the number of variables to increase its interpret-ability and reduce the risk of over fitting. Therefore I reduced the model to the top 15 variables which are shown on the plot above.
+
+```{r cache = TRUE}
+
+importantVar <- # Get the 15 most explained variables
+    fitModelRF$importance %>% #Mean Decrease Gini variables
+    data.frame %>% #Convert to dataframe for dplyr
+    add_rownames(var = 'Variables') %>% #Need row names for formula
+    arrange(desc(MeanDecreaseGini)) %>% #Arrange in descending order
+    .$Variables %>% 
+    .[1:15] %>% # Top 15 only
+    as.vector() %>% 
+    paste(collapse = ' + ') %>% 
+    paste('classe ~', .) # create formula for model
+    
+set.seed(34139)
+fitModelRF2 <- randomForest(as.formula(importantVar), data = train, distribution = 'multinomial')
+predictRF2 <- predict(fitModelRF, test, type = 'class')
+perf(predictRF2, test$classe)
+
+fitModelRF2
+fitModelRF2 %>% summary
+
+```
+
+Despite reducing my variables my final result was very close to my original model which included all the variables. Therefore my final model is a Random Forrest using just 15 variables.
+
+## Test results based on my final model
+
+```{r}
+predict(fitModelRF2, pml_test, type = 'class')
+```
+
+The final result from the test set is based against my final model.
+
+## Reference
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013. <http://groupware.les.inf.puc-rio.br/har#ixzz447iiJyEm>
+
