@@ -7,7 +7,8 @@ Coursera Practical Machine Learning Assignment
 
 One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants.
 
-### Review criterialess 
+### Review criteria
+
 What you should submit
 
 The goal of your project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set. You may use any of the other variables to predict with. You should create a report describing how you built your model, how you used cross validation, what you think the expected out of sample error is, and why you made the choices you did. You will also use your prediction model to predict 20 different test cases.
@@ -24,7 +25,7 @@ Apply your machine learning algorithm to the 20 test cases available in the test
 
 Due to security concerns with the exchange of R code, your code will not be run during the evaluation by your classmates. Please be sure that if they download the repo, they will be able to view the compiled HTML version of your analysis.
 
-#### Prediction Assignment Writeupless 
+#### Prediction Assignment Writeup
 
 #### Background
 
